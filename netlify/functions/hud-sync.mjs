@@ -1,6 +1,6 @@
+
 import { getStore } from "@netlify/blobs";
 
-const store = getStore("closety-wardrobes");
 const SESSION_LIFETIME = 7 * 24 * 60 * 60 * 1000;
 
 const headers = {
@@ -27,7 +27,7 @@ function validUUID(value) {
   );
 }
 
-async function getSession(token) {
+async function getSession(store, token) {
   if (!validUUID(token)) return null;
 
   const session = await store.get(`session:${token}`, {
@@ -41,7 +41,7 @@ async function getSession(token) {
   return session;
 }
 
-async function saveSession(session) {
+async function saveSession(store, session) {
   await store.setJSON(`session:${session.token}`, session);
 
   await store.setJSON(`avatar:${session.avatarUUID.toLowerCase()}`, {
@@ -58,9 +58,10 @@ export default async function handler(request) {
   }
 
   try {
+    const store = getStore("closety-wardrobes");
     const url = new URL(request.url);
 
-    // WEBSITE: Read the current connection and wardrobe state.
+    // Website: read the current connection and wardrobe state.
     if (request.method === "GET") {
       const action = url.searchParams.get("action");
       const token = url.searchParams.get("token");
@@ -69,7 +70,7 @@ export default async function handler(request) {
         return reply(400, { error: "Unknown action." });
       }
 
-      const session = await getSession(token);
+      const session = await getSession(store, token);
 
       if (!session) {
         return reply(401, {
@@ -93,7 +94,7 @@ export default async function handler(request) {
       return reply(405, { error: "Method not allowed." });
     }
 
-    // HUD: Read JSON from the incoming HTTP request.
+    // HUD: read the incoming JSON request.
     let body;
 
     try {
@@ -108,7 +109,7 @@ export default async function handler(request) {
 
     const action = body.action;
 
-    // HUD: Create a new website connection.
+    // HUD: create a new website connection.
     if (action === "pair") {
       if (!validUUID(body.token) || !validUUID(body.avatarUUID)) {
         return reply(400, {
@@ -132,7 +133,7 @@ export default async function handler(request) {
         expiresAt: now + SESSION_LIFETIME,
       };
 
-      await saveSession(session);
+      await saveSession(store, session);
 
       return reply(200, {
         ok: true,
@@ -141,7 +142,7 @@ export default async function handler(request) {
     }
 
     // All other actions require a valid paired session.
-    const session = await getSession(body.token);
+    const session = await getSession(store, body.token);
 
     if (!session) {
       return reply(401, {
@@ -154,18 +155,16 @@ export default async function handler(request) {
     session.lastSeen = now;
     session.updatedAt = now;
 
-    // HUD: Begin a fresh inventory scan.
     if (action === "scan_start") {
       session.folders = [];
       session.scanStatus = "scanning";
       session.scanStartedAt = now;
 
-      await saveSession(session);
+      await saveSession(store, session);
 
       return reply(200, { ok: true });
     }
 
-    // HUD: Receive a batch of inventory folder paths.
     if (action === "sync_chunk") {
       if (session.scanStatus !== "scanning") {
         return reply(409, {
@@ -174,9 +173,7 @@ export default async function handler(request) {
       }
 
       if (!Array.isArray(body.paths)) {
-        return reply(400, {
-          error: "paths must be an array.",
-        });
+        return reply(400, { error: "paths must be an array." });
       }
 
       const incoming = body.paths
@@ -188,7 +185,7 @@ export default async function handler(request) {
         ...new Set([...(session.folders || []), ...incoming]),
       ].slice(0, 10000);
 
-      await saveSession(session);
+      await saveSession(store, session);
 
       return reply(200, {
         ok: true,
@@ -197,12 +194,11 @@ export default async function handler(request) {
       });
     }
 
-    // HUD: Mark the scan as complete.
     if (action === "scan_finish") {
       session.scanStatus = "complete";
       session.scanFinishedAt = now;
 
-      await saveSession(session);
+      await saveSession(store, session);
 
       return reply(200, {
         ok: true,
