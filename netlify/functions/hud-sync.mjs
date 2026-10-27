@@ -1,27 +1,30 @@
-
 import { getStore } from "@netlify/blobs";
 
 const store = getStore("closety-wardrobes");
 const SESSION_LIFETIME = 7 * 24 * 60 * 60 * 1000;
 
 const headers = {
-  "Content-Type": "application/json",
+  "Content-Type": "application/json; charset=utf-8",
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
 function reply(statusCode, data) {
-  return {
-    statusCode,
-    headers,
-    body: JSON.stringify(data),
-  };
+  return new Response(
+    statusCode === 204 ? null : JSON.stringify(data),
+    {
+      status: statusCode,
+      headers,
+    }
+  );
 }
 
 function validUUID(value) {
-  return typeof value === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+  );
 }
 
 async function getSession(token) {
@@ -31,7 +34,7 @@ async function getSession(token) {
     type: "json",
   });
 
-  if (!session || session.expiresAt < Date.now()) {
+  if (!session || !session.expiresAt || session.expiresAt < Date.now()) {
     return null;
   }
 
@@ -40,6 +43,7 @@ async function getSession(token) {
 
 async function saveSession(session) {
   await store.setJSON(`session:${session.token}`, session);
+
   await store.setJSON(`avatar:${session.avatarUUID.toLowerCase()}`, {
     token: session.token,
     avatarUUID: session.avatarUUID,
@@ -48,18 +52,15 @@ async function saveSession(session) {
   });
 }
 
-export default async (request) => {
+export default async function handler(request) {
   if (request.method === "OPTIONS") {
-    return {
-      statusCode: 204,
-      headers,
-      body: "",
-    };
+    return reply(204, {});
   }
 
   try {
     const url = new URL(request.url);
 
+    // WEBSITE: Read the current connection and wardrobe state.
     if (request.method === "GET") {
       const action = url.searchParams.get("action");
       const token = url.searchParams.get("token");
@@ -82,7 +83,7 @@ export default async (request) => {
         avatarUUID: session.avatarUUID,
         avatarName: session.avatarName,
         scanStatus: session.scanStatus,
-        folders: session.folders,
+        folders: session.folders || [],
         lastSeen: session.lastSeen,
         updatedAt: session.updatedAt,
       });
@@ -92,19 +93,37 @@ export default async (request) => {
       return reply(405, { error: "Method not allowed." });
     }
 
-    const body = JSON.parse(request.body || "{}");
+    // HUD: Read JSON from the incoming HTTP request.
+    let body;
+
+    try {
+      body = await request.json();
+    } catch {
+      return reply(400, { error: "Invalid JSON request body." });
+    }
+
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return reply(400, { error: "Request body must be a JSON object." });
+    }
+
     const action = body.action;
 
+    // HUD: Create a new website connection.
     if (action === "pair") {
       if (!validUUID(body.token) || !validUUID(body.avatarUUID)) {
-        return reply(400, { error: "Invalid pairing token or avatar UUID." });
+        return reply(400, {
+          error: "Invalid pairing token or avatar UUID.",
+        });
       }
 
       const now = Date.now();
+
       const session = {
         token: body.token,
         avatarUUID: body.avatarUUID,
-        avatarName: String(body.avatarName || "Second Life avatar").slice(0, 100),
+        avatarName: String(
+          body.avatarName || "Second Life avatar"
+        ).slice(0, 100),
         scanStatus: "waiting",
         folders: [],
         createdAt: now,
@@ -121,32 +140,43 @@ export default async (request) => {
       });
     }
 
+    // All other actions require a valid paired session.
     const session = await getSession(body.token);
 
     if (!session) {
-      return reply(401, { error: "Connection expired. Please reconnect." });
+      return reply(401, {
+        error: "Connection expired. Please reconnect.",
+      });
     }
 
     const now = Date.now();
+
     session.lastSeen = now;
     session.updatedAt = now;
 
+    // HUD: Begin a fresh inventory scan.
     if (action === "scan_start") {
       session.folders = [];
       session.scanStatus = "scanning";
       session.scanStartedAt = now;
+
       await saveSession(session);
 
       return reply(200, { ok: true });
     }
 
+    // HUD: Receive a batch of inventory folder paths.
     if (action === "sync_chunk") {
       if (session.scanStatus !== "scanning") {
-        return reply(409, { error: "Start a scan before sending folders." });
+        return reply(409, {
+          error: "Start a scan before sending folders.",
+        });
       }
 
       if (!Array.isArray(body.paths)) {
-        return reply(400, { error: "paths must be an array." });
+        return reply(400, {
+          error: "paths must be an array.",
+        });
       }
 
       const incoming = body.paths
@@ -154,7 +184,10 @@ export default async (request) => {
         .map((path) => path.trim())
         .filter((path) => path.length > 0 && path.length <= 500);
 
-      session.folders = [...new Set([...session.folders, ...incoming])].slice(0, 10000);
+      session.folders = [
+        ...new Set([...(session.folders || []), ...incoming]),
+      ].slice(0, 10000);
+
       await saveSession(session);
 
       return reply(200, {
@@ -164,20 +197,25 @@ export default async (request) => {
       });
     }
 
+    // HUD: Mark the scan as complete.
     if (action === "scan_finish") {
       session.scanStatus = "complete";
       session.scanFinishedAt = now;
+
       await saveSession(session);
 
       return reply(200, {
         ok: true,
-        total: session.folders.length,
+        total: (session.folders || []).length,
       });
     }
 
     return reply(400, { error: "Unknown action." });
   } catch (error) {
     console.error("Closety HUD sync error:", error);
-    return reply(500, { error: "Server error. Check the Netlify function logs." });
+
+    return reply(500, {
+      error: "Server error. Check the Netlify function logs.",
+    });
   }
-};
+}
