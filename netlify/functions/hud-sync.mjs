@@ -13,10 +13,7 @@ const headers = {
 function reply(statusCode, data) {
   return new Response(
     statusCode === 204 ? null : JSON.stringify(data),
-    {
-      status: statusCode,
-      headers,
-    }
+    { status: statusCode, headers }
   );
 }
 
@@ -34,7 +31,11 @@ async function getSession(store, token) {
     type: "json",
   });
 
-  if (!session || !session.expiresAt || session.expiresAt < Date.now()) {
+  if (
+    !session ||
+    !session.expiresAt ||
+    session.expiresAt < Date.now()
+  ) {
     return null;
   }
 
@@ -44,12 +45,15 @@ async function getSession(store, token) {
 async function saveSession(store, session) {
   await store.setJSON(`session:${session.token}`, session);
 
-  await store.setJSON(`avatar:${session.avatarUUID.toLowerCase()}`, {
-    token: session.token,
-    avatarUUID: session.avatarUUID,
-    avatarName: session.avatarName,
-    updatedAt: Date.now(),
-  });
+  await store.setJSON(
+    `avatar:${session.avatarUUID.toLowerCase()}`,
+    {
+      token: session.token,
+      avatarUUID: session.avatarUUID,
+      avatarName: session.avatarName,
+      updatedAt: Date.now(),
+    }
+  );
 }
 
 export default async function handler(request) {
@@ -61,7 +65,7 @@ export default async function handler(request) {
     const store = getStore("closety-wardrobes");
     const url = new URL(request.url);
 
-    // Website: read the current connection and wardrobe state.
+    // WEBSITE: return the saved wardrobe state.
     if (request.method === "GET") {
       const action = url.searchParams.get("action");
       const token = url.searchParams.get("token");
@@ -79,12 +83,22 @@ export default async function handler(request) {
         });
       }
 
+      const folders = Array.isArray(session.folders)
+        ? session.folders
+        : [];
+
+      console.log("Closety state read:", {
+        avatarUUID: session.avatarUUID,
+        scanStatus: session.scanStatus,
+        folderCount: folders.length,
+      });
+
       return reply(200, {
         connected: true,
         avatarUUID: session.avatarUUID,
         avatarName: session.avatarName,
-        scanStatus: session.scanStatus,
-        folders: session.folders || [],
+        scanStatus: session.scanStatus || "waiting",
+        folders,
         lastSeen: session.lastSeen,
         updatedAt: session.updatedAt,
       });
@@ -94,7 +108,6 @@ export default async function handler(request) {
       return reply(405, { error: "Method not allowed." });
     }
 
-    // HUD: read the incoming JSON request.
     let body;
 
     try {
@@ -104,12 +117,14 @@ export default async function handler(request) {
     }
 
     if (!body || typeof body !== "object" || Array.isArray(body)) {
-      return reply(400, { error: "Request body must be a JSON object." });
+      return reply(400, {
+        error: "Request body must be a JSON object.",
+      });
     }
 
     const action = body.action;
 
-    // HUD: create a new website connection.
+    // HUD: pair a new connection.
     if (action === "pair") {
       if (!validUUID(body.token) || !validUUID(body.avatarUUID)) {
         return reply(400, {
@@ -135,13 +150,11 @@ export default async function handler(request) {
 
       await saveSession(store, session);
 
-      return reply(200, {
-        ok: true,
-        message: "HUD paired with Closety.",
-      });
+      console.log("Closety paired:", session.avatarUUID);
+
+      return reply(200, { ok: true, message: "HUD paired with Closety." });
     }
 
-    // All other actions require a valid paired session.
     const session = await getSession(store, body.token);
 
     if (!session) {
@@ -155,23 +168,22 @@ export default async function handler(request) {
     session.lastSeen = now;
     session.updatedAt = now;
 
+    // HUD: start a new scan.
     if (action === "scan_start") {
       session.folders = [];
       session.scanStatus = "scanning";
       session.scanStartedAt = now;
+      delete session.scanFinishedAt;
 
       await saveSession(store, session);
 
-      return reply(200, { ok: true });
+      console.log("Closety scan started:", session.avatarUUID);
+
+      return reply(200, { ok: true, folderCount: 0 });
     }
 
+    // HUD: save a group of discovered folder paths.
     if (action === "sync_chunk") {
-      if (session.scanStatus !== "scanning") {
-        return reply(409, {
-          error: "Start a scan before sending folders.",
-        });
-      }
-
       if (!Array.isArray(body.paths)) {
         return reply(400, { error: "paths must be an array." });
       }
@@ -181,29 +193,61 @@ export default async function handler(request) {
         .map((path) => path.trim())
         .filter((path) => path.length > 0 && path.length <= 500);
 
+      // Recover a lost scan state rather than rejecting valid paths.
+      if (session.scanStatus !== "scanning") {
+        console.warn(
+          "Closety recovered scan state during upload:",
+          session.avatarUUID,
+          "Previous status:",
+          session.scanStatus
+        );
+
+        session.scanStatus = "scanning";
+        session.scanStartedAt = session.scanStartedAt || now;
+        delete session.scanFinishedAt;
+      }
+
       session.folders = [
-        ...new Set([...(session.folders || []), ...incoming]),
+        ...new Set([
+          ...(Array.isArray(session.folders) ? session.folders : []),
+          ...incoming,
+        ]),
       ].slice(0, 10000);
 
       await saveSession(store, session);
 
+      console.log("Closety folders saved:", {
+        avatarUUID: session.avatarUUID,
+        received: incoming.length,
+        totalSaved: session.folders.length,
+        paths: incoming,
+      });
+
       return reply(200, {
         ok: true,
+        recovered: session.scanStatus === "scanning",
         received: incoming.length,
         total: session.folders.length,
       });
     }
 
+    // HUD: finish the scan without clearing saved paths.
     if (action === "scan_finish") {
       session.scanStatus = "complete";
       session.scanFinishedAt = now;
 
+      const total = Array.isArray(session.folders)
+        ? session.folders.length
+        : 0;
+
       await saveSession(store, session);
 
-      return reply(200, {
-        ok: true,
-        total: (session.folders || []).length,
+      console.log("Closety scan finished:", {
+        avatarUUID: session.avatarUUID,
+        totalSaved: total,
       });
+
+      return reply(200, { ok: true, total });
     }
 
     return reply(400, { error: "Unknown action." });
