@@ -18,8 +18,12 @@ function buildTree(paths) {
 
     for (const part of parts) {
       if (!node.children[part]) {
-        node.children[part] = { name: part, children: {} };
+        node.children[part] = {
+          name: part,
+          children: {},
+        };
       }
+
       node = node.children[part];
     }
   }
