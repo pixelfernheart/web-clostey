@@ -1,497 +1,336 @@
 
-import { useEffect, useState } from "react";
-import {
-  getProfiles,
-  getWardrobe,
-  exportBackup,
-  importBackup,
-  requestPersistentStorage,
-  getStorageEstimate,
-} from "./db";
-
+import { useEffect, useMemo, useState } from "react";
 import "./style.css";
 
-export default function App() {
-  const [profiles, setProfiles] = useState([]);
-  const [activeId, setActiveId] = useState("");
-  const [root, setRoot] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState("");
-  const [search, setSearch] = useState("");
-  const [expanded, setExpanded] = useState({});
-  const [storage, setStorage] = useState(null);
-  const [loading, setLoading] = useState(true);
+const API_URL = "/api/hud-sync";
 
-  useEffect(() => {
-    initialize();
-  }, []);
+function buildTree(paths) {
+  const root = { name: "WC", children: {} };
 
-  useEffect(() => {
-    let cancelled = false;
+  for (const originalPath of paths || []) {
+    const parts = String(originalPath)
+      .replace(/^#?RLV[\\/]/i, "")
+      .replace(/^WC[\\/]/i, "")
+      .split(/[\\/]/)
+      .filter(Boolean);
 
-    async function loadWardrobe() {
-      if (!activeId) {
-        setRoot(null);
-        return;
+    let node = root;
+
+    for (const part of parts) {
+      if (!node.children[part]) {
+        node.children[part] = { name: part, children: {} };
       }
-
-      try {
-        const wardrobe = await getWardrobe(activeId);
-
-        if (!cancelled) {
-          setRoot(wardrobe || null);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setNotice(`Could not load wardrobe: ${error.message}`);
-          setRoot(null);
-        }
-      }
-    }
-
-    loadWardrobe();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeId]);
-
-  async function initialize() {
-    try {
-      await requestPersistentStorage();
-
-      const savedProfiles = await getProfiles();
-
-      setProfiles(savedProfiles);
-
-      if (savedProfiles.length > 0) {
-        setActiveId(savedProfiles[0].id);
-      }
-
-      const estimate = await getStorageEstimate();
-      setStorage(estimate);
-    } catch (error) {
-      setNotice(`Storage error: ${error.message}`);
-    } finally {
-      setLoading(false);
+      node = node.children[part];
     }
   }
 
-  async function refreshProfiles(selectId) {
-    const savedProfiles = await getProfiles();
+  return root;
+}
 
-    setProfiles(savedProfiles);
-
-    if (selectId) {
-      setActiveId(selectId);
-    }
-
-    const estimate = await getStorageEstimate();
-    setStorage(estimate);
-  }
-
-  async function handleImport(event) {
-    const file = event.target.files?.[0];
-
-    // Allow the same backup file to be selected again.
-    event.target.value = "";
-
-    if (!file) return;
-
-    setBusy(true);
-    setNotice("");
-
-    try {
-      const profile = await importBackup(file);
-
-      await refreshProfiles(profile.id);
-
-      setNotice(
-        `Backup restored successfully: "${profile.name}".`
-      );
-    } catch (error) {
-      setNotice(`Import failed: ${error.message}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleExport() {
-    if (!activeId || busy) return;
-
-    setBusy(true);
-    setNotice("");
-
-    try {
-      await exportBackup(activeId);
-      setNotice("Backup export started.");
-    } catch (error) {
-      setNotice(`Export failed: ${error.message}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function toggleFolder(key) {
-    setExpanded((previous) => ({
-      ...previous,
-      [key]: !previous[key],
-    }));
-  }
-
-  function getItemName(item) {
-    return item?.name || item?.label || "Unnamed item";
-  }
-
-  function nodeMatchesSearch(node, query) {
-    if (!node) return false;
-
-    const name = getItemName(node).toLowerCase();
-    const path = (node.path || "").toLowerCase();
-
-    if (name.includes(query) || path.includes(query)) {
-      return true;
-    }
-
-    return Array.isArray(node.children) &&
-      node.children.some((child) =>
-        nodeMatchesSearch(child, query)
-      );
-  }
-
-  function renderNode(node, path = "", depth = 0) {
-    if (!node) return null;
-
-    const name = getItemName(node);
-    const nodePath = path ? `${path}/${name}` : name;
-
-    const children = Array.isArray(node.children)
-      ? node.children
-      : [];
-
-    const isFolder =
-      node.type === "root" ||
-      node.type === "folder" ||
-      children.length > 0;
-
-    if (isFolder) {
-      const query = search.trim().toLowerCase();
-
-      const visibleChildren = children.filter((child) =>
-        !query || nodeMatchesSearch(child, query)
-      );
-
-      const isOpen =
-        Boolean(query) || Boolean(expanded[nodePath]);
-
-      return (
-        <div
-          className="inventory-folder"
-          key={nodePath}
-          style={{ "--depth": depth }}
-        >
-          <button
-            className="folder-row"
-            onClick={() => toggleFolder(nodePath)}
-            type="button"
-          >
-            <span className="folder-icon">
-              {isOpen ? "📂" : "📁"}
-            </span>
-
-            <span className="folder-name">{name}</span>
-
-            <span className="folder-count">
-              {children.length}
-            </span>
-
-            <span className="folder-chevron">
-              {isOpen ? "−" : "+"}
-            </span>
-          </button>
-
-          {isOpen && (
-            <div className="folder-children">
-              {visibleChildren.length > 0 ? (
-                visibleChildren.map((child) =>
-                  renderNode(child, nodePath, depth + 1)
-                )
-              ) : (
-                <p className="empty-folder">
-                  {query
-                    ? "No matching items."
-                    : "This folder is empty. Inventory will appear after a successful HUD sync."}
-                </p>
-              )}
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    if (!nodeMatchesSearch(node, search.trim().toLowerCase())) {
-      return null;
-    }
-
-    return (
-      <div
-        className="inventory-item"
-        key={node.id || nodePath}
-      >
-        <div className="item-symbol">◇</div>
-
-        <div className="item-details">
-          <strong>{name}</strong>
-
-          <span>
-            {node.kind || node.type || "Inventory item"}
-          </span>
-        </div>
-
-        <span className="item-status">Saved</span>
-      </div>
-    );
-  }
-
-  const activeProfile = profiles.find(
-    (profile) => profile.id === activeId
+function Folder({ node, depth = 0 }) {
+  const [open, setOpen] = useState(depth < 1);
+  const children = Object.values(node.children || {}).sort((a, b) =>
+    a.name.localeCompare(b.name)
   );
 
-  function formatBytes(bytes) {
-    if (!Number.isFinite(bytes)) return "Unknown";
+  return (
+    <div className="folder-node">
+      <button
+        className="folder-row"
+        style={{ paddingLeft: `${14 + depth * 20}px` }}
+        onClick={() => setOpen(!open)}
+        type="button"
+      >
+        <span className="folder-chevron">
+          {children.length ? (open ? "⌄" : "›") : "·"}
+        </span>
+        <span className="folder-icon">{children.length ? "📁" : "🗂️"}</span>
+        <span className="folder-name">{node.name}</span>
+        {children.length > 0 && (
+          <span className="folder-count">{children.length}</span>
+        )}
+      </button>
 
-    if (bytes < 1024) {
-      return `${bytes} B`;
+      {open &&
+        children.map((child) => (
+          <Folder key={child.name} node={child} depth={depth + 1} />
+        ))}
+    </div>
+  );
+}
+
+export default function App() {
+  const token = useMemo(
+    () => new URLSearchParams(window.location.search).get("token"),
+    []
+  );
+
+  const [connection, setConnection] = useState("checking");
+  const [avatarName, setAvatarName] = useState("");
+  const [avatarUUID, setAvatarUUID] = useState("");
+  const [scanStatus, setScanStatus] = useState("waiting");
+  const [folders, setFolders] = useState([]);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!token) {
+      setConnection("disconnected");
+      return;
     }
 
-    if (bytes < 1024 * 1024) {
-      return `${(bytes / 1024).toFixed(1)} KB`;
+    let active = true;
+    let timer;
+
+    async function refresh() {
+      try {
+        const response = await fetch(
+          `${API_URL}?action=state&token=${encodeURIComponent(token)}`,
+          { cache: "no-store" }
+        );
+
+        const data = await response.json();
+
+        if (!active) return;
+
+        if (!response.ok || !data.connected) {
+          setConnection("disconnected");
+          setError(data.error || "The HUD connection could not be verified.");
+          return;
+        }
+
+        setConnection("connected");
+        setError("");
+        setAvatarName(data.avatarName || "Second Life avatar");
+        setAvatarUUID(data.avatarUUID || "");
+        setScanStatus(data.scanStatus || "waiting");
+        setFolders(Array.isArray(data.folders) ? data.folders : []);
+        setLastUpdated(data.updatedAt ? new Date(data.updatedAt) : null);
+      } catch {
+        if (!active) return;
+        setConnection("error");
+        setError("Cannot reach the Closety server. Check your internet connection.");
+      }
     }
 
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  }
+    refresh();
+    timer = window.setInterval(refresh, 4000);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [token]);
+
+  const tree = useMemo(() => buildTree(folders), [folders]);
+
+  const status = !token
+    ? "HUD NOT CONNECTED"
+    : connection === "checking"
+      ? "CHECKING CONNECTION"
+      : connection === "error"
+        ? "CONNECTION ERROR"
+        : connection === "disconnected"
+          ? "HUD NOT CONNECTED"
+          : scanStatus === "complete"
+            ? "HUD CONNECTED"
+            : scanStatus === "scanning"
+              ? "SCANNING WARDROBE"
+              : "HUD PAIRED · WAITING FOR SCAN";
+
+  const statusClass =
+    connection === "connected"
+      ? scanStatus === "complete"
+        ? "status-connected"
+        : "status-pending"
+      : "status-offline";
 
   return (
     <main className="closety-app">
-      <header className="topbar">
-        <a className="brand" href="#home">
-          <span className="brand-mark">C</span>
-
-          <span>
-            <strong>Closety</strong>
-            <small>YOUR SECOND LIFE WARDROBE</small>
-          </span>
-        </a>
-
-        <div className="topbar-right">
-          <span className="local-badge">
-            <span className="status-dot" />
-            LOCAL STORAGE
-          </span>
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">C</div>
+          <div>
+            <div className="brand-name">closety</div>
+            <div className="brand-subtitle">YOUR VIRTUAL WARDROBE</div>
+          </div>
         </div>
-      </header>
 
-      <div className="app-layout">
-        <aside className="sidebar">
-          <div className="sidebar-heading">YOUR SPACE</div>
+        <div className="side-label">WARDROBE</div>
+        <div className="side-link active">
+          <span>▦</span> My Closet
+        </div>
+        <div className="side-link muted">
+          <span>◇</span> Outfits
+          <span className="coming-soon">SYNC</span>
+        </div>
+        <div className="side-link muted">
+          <span>▧</span> Categories
+        </div>
 
-          <button
-            className="nav-item active"
-            type="button"
-          >
-            <span>▦</span>
-            My Wardrobe
-          </button>
-
-          <div className="sidebar-divider" />
-
-          <div className="sidebar-heading">
-            BACKUP &amp; RESTORE
+        <div className="sidebar-bottom">
+          <div className="mini-avatar">SL</div>
+          <div className="sidebar-user">
+            <strong>Second Life</strong>
+            <span>HUD connection</span>
           </div>
+          <span className="small-dot" />
+        </div>
+      </aside>
 
-          <button
-            className="secondary-button full-width"
-            disabled={!activeId || busy}
-            onClick={handleExport}
-            type="button"
-          >
-            ↓ Export backup
-          </button>
-
-          <label
-            className={`secondary-button full-width file-button ${
-              busy ? "disabled" : ""
-            }`}
-          >
-            ↑ Import backup
-
-            <input
-              type="file"
-              accept=".json,application/json"
-              onChange={handleImport}
-              disabled={busy}
-              hidden
-            />
-          </label>
-
-          <p className="sidebar-hint">
-            Save a backup to a USB drive to help protect your
-            wardrobe when reinstalling Windows.
-          </p>
-
-          <div className="sidebar-bottom">
-            <div className="storage-heading">
-              <span>Browser storage</span>
-              <span>IndexedDB</span>
-            </div>
-
-            <p>Used: {formatBytes(storage?.usage)}</p>
-
-            <p>
-              Estimated limit: {formatBytes(storage?.quota)}
-            </p>
-
-            <small>
-              Estimates cover this website's browser storage,
-              not only Closety.
-            </small>
+      <section className="main-area">
+        <header className="topbar">
+          <div className="breadcrumb">My Closet <span>/</span> Overview</div>
+          <div className="topbar-right">
+            <span className="private-tag">🔒 PRIVATE CLOSET</span>
+            <div className="top-avatar">C</div>
           </div>
-        </aside>
+        </header>
 
-        <section className="main-content" id="home">
+        <div className="content">
           <div className="welcome-row">
             <div>
-              <div className="eyebrow">
-                YOUR PERSONAL COLLECTION
-              </div>
-
-              <h1>My Wardrobe</h1>
-
-              <p className="subtitle">
-                Your clothes, your folders, your space.
+              <div className="eyebrow">YOUR SPACE. YOUR STYLE.</div>
+              <h1>Your closet, <span>your way.</span></h1>
+              <p className="welcome-copy">
+                Keep your Second Life wardrobe organised in one place.
               </p>
             </div>
-
-            <div className="sync-pill">
-              <span className="status-dot muted-dot" />
-              HUD NOT CONNECTED
+            <div className="decorative-orbit">
+              <div className="orbit-circle">✳</div>
+              <span className="orbit-dot dot-one" />
+              <span className="orbit-dot dot-two" />
             </div>
           </div>
 
-          {notice && (
-            <div className="notice" role="status">
-              <span>{notice}</span>
+          <section className="connection-card">
+            <div className="connection-left">
+              <div className="connection-icon">⌘</div>
+              <div>
+                <div className="card-overline">SECOND LIFE INTEGRATION</div>
+                <h2>Closety HUD</h2>
+                <p>
+                  {avatarName
+                    ? `Paired avatar: ${avatarName}`
+                    : "Connect your in-world HUD to sync your wardrobe."}
+                </p>
+                {avatarUUID && (
+                  <div className="avatar-uuid">Avatar UUID: {avatarUUID}</div>
+                )}
+              </div>
+            </div>
+            <div className="connection-right">
+              <div className={`status-pill ${statusClass}`}>
+                <span className="status-dot" />
+                {status}
+              </div>
+              <p className="connection-hint">
+                {scanStatus === "complete" && connection === "connected"
+                  ? "Your latest scan is available below."
+                  : "Use CONNECT and then SCAN in your in-world HUD."}
+              </p>
+            </div>
+          </section>
 
-              <button
-                type="button"
-                aria-label="Dismiss message"
-                onClick={() => setNotice("")}
-              >
-                ×
-              </button>
+          {error && (
+            <div className="error-message">
+              <strong>Connection issue</strong>
+              <span>{error}</span>
+              {!token && (
+                <span>
+                  Open the website using the URL supplied by your Closety HUD.
+                </span>
+              )}
             </div>
           )}
 
-          <section className="profile-banner">
-            <div className="profile-avatar">SL</div>
+          <div className="stats-grid">
+            <article className="stat-card">
+              <div className="stat-top">
+                <span className="stat-label">DISCOVERED FOLDERS</span>
+                <span className="stat-icon green-icon">▤</span>
+              </div>
+              <div className="stat-number">{folders.length}</div>
+              <div className="stat-foot">Folders received from your HUD</div>
+            </article>
 
-            <div className="profile-info">
-              <span>SECOND LIFE AVATAR</span>
+            <article className="stat-card">
+              <div className="stat-top">
+                <span className="stat-label">HUD STATUS</span>
+                <span className="stat-icon purple-icon">⌁</span>
+              </div>
+              <div className="stat-number stat-word">
+                {connection === "connected" ? "Paired" : "Offline"}
+              </div>
+              <div className="stat-foot">
+                {connection === "connected"
+                  ? "Server recognises this pairing"
+                  : "Waiting for a valid pairing"}
+              </div>
+            </article>
 
-              <h2>
-                {activeProfile?.name ||
-                  "Waiting for HUD connection"}
-              </h2>
-
-              <p>
-                {activeProfile
-                  ? "Inventory root: #RLV/WC"
-                  : "Your avatar UUID and wardrobe will be supplied by the HUD when the connection is implemented."}
-              </p>
-            </div>
-
-            <div className="private-label">
-              <span>●</span>
-              {activeProfile ? "Local wardrobe" : "Not connected"}
-            </div>
-          </section>
-
-          <div className="inventory-toolbar">
-            <div>
-              <h2>Inventory folders</h2>
-
-              <p>
-                Your folder structure will appear here after
-                the HUD sync feature is connected.
-              </p>
-            </div>
-
-            <div className="search-box">
-              <span>⌕</span>
-
-              <input
-                aria-label="Search inventory"
-                placeholder="Search folders and items..."
-                value={search}
-                onChange={(event) =>
-                  setSearch(event.target.value)
-                }
-              />
-            </div>
+            <article className="stat-card">
+              <div className="stat-top">
+                <span className="stat-label">LAST UPDATE</span>
+                <span className="stat-icon green-icon">◷</span>
+              </div>
+              <div className="stat-number stat-word">
+                {lastUpdated
+                  ? lastUpdated.toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })
+                  : "—"}
+              </div>
+              <div className="stat-foot">
+                {lastUpdated ? lastUpdated.toLocaleDateString() : "No data yet"}
+              </div>
+            </article>
           </div>
 
-          <section className="inventory-panel">
-            <div className="inventory-panel-header">
-              <span>FOLDER STRUCTURE</span>
-              <span>#RLV/WC</span>
+          <section className="wardrobe-section">
+            <div className="section-heading">
+              <div>
+                <div className="eyebrow">INVENTORY OVERVIEW</div>
+                <h2>Your wardrobe folders</h2>
+                <p>Folder structure received from your Second Life HUD.</p>
+              </div>
+              <span className="folder-total">{folders.length} folders</span>
             </div>
 
-            {loading ? (
-              <p className="empty-folder">
-                Loading Closety...
-              </p>
-            ) : root ? (
-              renderNode(root)
+            {folders.length > 0 ? (
+              <div className="folder-panel">
+                <Folder node={tree} />
+              </div>
             ) : (
               <div className="empty-state">
-                <div className="empty-icon">▤</div>
-
-                <h2>Your wardrobe is waiting</h2>
-
+                <div className="empty-illustration">📂</div>
+                <h3>Your closet is waiting</h3>
                 <p>
-                  Once the HUD is built and connected, Closety
-                  will receive your Second Life avatar details
-                  and inventory data.
+                  Open Second Life, click CONNECT in your Closety HUD, then
+                  choose SCAN to send your folder list here.
                 </p>
+                <div className="empty-steps">
+                  <span><b>1</b> Wear the HUD</span>
+                  <span><b>2</b> Click CONNECT</span>
+                  <span><b>3</b> Click SCAN</span>
+                </div>
               </div>
             )}
+
+            <p className="inventory-note">
+              <strong>Note:</strong> RLV folder discovery returns folder names
+              and paths, not a complete list of loose wearable objects inside
+              every folder. Outfit item details need additional HUD support.
+            </p>
           </section>
 
-          <section className="connection-card">
-            <div className="connection-icon">↔</div>
-
-            <div>
-              <h3>Second Life connection</h3>
-
-              <p>
-                The website is not connected to Second Life yet.
-                The next development stage is the RLV HUD and
-                the secure process that sends inventory data
-                to Closety.
-              </p>
-            </div>
-
-            <span className="connection-status">
-              Not connected
-            </span>
-          </section>
-
-          <footer className="page-footer">
-            <span>Closety · Private wardrobe workspace</span>
-            <span>Local browser database</span>
+          <footer className="footer">
+            <span>closety <span className="footer-heart">♥</span> made for your Second Life wardrobe</span>
+            <span>PRIVATE WARDROBE</span>
           </footer>
-        </section>
-      </div>
+        </div>
+      </section>
     </main>
   );
 }
