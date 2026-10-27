@@ -1,4 +1,3 @@
-
 [build]
   command = "npm run build"
   publish = "dist"
@@ -8,6 +7,7 @@
   from = "/api/hud-sync"
   to = "/.netlify/functions/hud-sync"
   status = 200
+  force = true
 
 [[redirects]]
   from = "/*"
