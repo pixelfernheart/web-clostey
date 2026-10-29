@@ -1,4 +1,3 @@
-
 import { getStore } from "@netlify/blobs";
 
 const STORE_NAME = "closety-bridge";
@@ -87,7 +86,13 @@ export default async function handler(request) {
   }
 
   try {
-    const store = getStore(STORE_NAME);
+    // Strong consistency: a pair write must be visible to the
+    // very next next_command read from any edge / isolate.
+    const store = getStore({
+      name: STORE_NAME,
+      consistency: "strong",
+    });
+
     const url = new URL(request.url);
 
     let data = {};
