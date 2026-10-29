@@ -37,8 +37,8 @@ function cleanPaths(paths) {
   if (!Array.isArray(paths)) return [];
 
   return paths
-    .filter((p) => typeof p === "string")
-    .map((p) => p.trim())
+    .filter((path) => typeof path === "string")
+    .map((path) => path.trim())
     .filter(Boolean)
     .slice(0, 5000);
 }
@@ -51,11 +51,12 @@ async function readSession(store, token) {
 
 async function saveSession(store, token, session) {
   session.updatedAt = new Date().toISOString();
-
   await store.setJSON(`${PREFIX}${token}`, session);
 }
 
 function createSession(token, avatarUUID, avatarName) {
+  const now = new Date().toISOString();
+
   return {
     token,
     avatarUUID,
@@ -68,17 +69,14 @@ function createSession(token, avatarUUID, avatarName) {
     commandResults: [],
     scanStartedAt: null,
     scanFinishedAt: null,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt: now,
+    updatedAt: now,
   };
 }
 
 export default async function handler(request) {
   if (request.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers,
-    });
+    return new Response(null, { status: 204, headers });
   }
 
   if (!["GET", "POST"].includes(request.method)) {
@@ -95,8 +93,10 @@ export default async function handler(request) {
     let data = {};
 
     if (request.method === "GET") {
-      data.action = clean(url.searchParams.get("action"), 80);
-      data.token = clean(url.searchParams.get("token"), 200);
+      data = {
+        action: clean(url.searchParams.get("action"), 80),
+        token: clean(url.searchParams.get("token"), 200),
+      };
     } else {
       try {
         data = await request.json();
@@ -118,7 +118,7 @@ export default async function handler(request) {
       });
     }
 
-    // Pair the HUD with a session.
+    // Pairing creates or updates the session.
     if (request.method === "POST" && action === "pair") {
       const avatarUUID = clean(data.avatarUUID, 100);
       const avatarName = clean(data.avatarName, 100);
@@ -131,11 +131,10 @@ export default async function handler(request) {
       }
 
       const existing = await readSession(store, token);
-
       const session =
-        existing ||
-        createSession(token, avatarUUID, avatarName);
+        existing || createSession(token, avatarUUID, avatarName);
 
+      session.token = token;
       session.avatarUUID = avatarUUID;
       session.avatarName = avatarName;
       session.paired = true;
@@ -158,40 +157,45 @@ export default async function handler(request) {
       });
     }
 
-    // HUD polls for the next command.
+    // Support both the website's "state" and "status" names.
+    if (
+      request.method === "GET" &&
+      (action === "state" || action === "status")
+    ) {
+      return reply(200, {
+        ok: true,
+        connected: true,
+        paired: true,
+        avatarUUID: session.avatarUUID || "",
+        avatarName: session.avatarName || "",
+        scanning: Boolean(session.scanning),
+        scanStatus: session.scanning
+          ? "scanning"
+          : session.scanFinishedAt
+            ? "complete"
+            : "waiting",
+        folders: session.inventoryPaths || [],
+        inventoryCount: (session.inventoryPaths || []).length,
+        wornState: session.wornState || [],
+        queuedCommands: (session.commands || []).length,
+        commandResults: (session.commandResults || []).slice(-20),
+        updatedAt: session.updatedAt || null,
+        lastScan: session.scanFinishedAt || null,
+      });
+    }
+
+    // HUD polls for a command.
     if (
       request.method === "GET" &&
       action === "next_command"
     ) {
-      const command = session.commands.shift() || null;
+      const command = (session.commands || []).shift() || null;
 
       if (command) {
         await saveSession(store, token, session);
       }
 
-      return reply(200, {
-        ok: true,
-        command,
-      });
-    }
-
-    // Website checks session status.
-    if (
-      request.method === "GET" &&
-      action === "status"
-    ) {
-      return reply(200, {
-        ok: true,
-        paired: session.paired,
-        avatarUUID: session.avatarUUID,
-        avatarName: session.avatarName,
-        scanning: session.scanning,
-        inventoryCount: session.inventoryPaths.length,
-        queuedCommands: session.commands.length,
-        lastScan: session.scanFinishedAt,
-        wornState: session.wornState,
-        commandResults: session.commandResults.slice(-20),
-      });
+      return reply(200, { ok: true, command });
     }
 
     if (request.method !== "POST") {
@@ -201,7 +205,6 @@ export default async function handler(request) {
       });
     }
 
-    // Start scanning the #RLV/WC inventory root.
     if (action === "scan_start") {
       session.scanning = true;
       session.inventoryPaths = [];
@@ -216,17 +219,19 @@ export default async function handler(request) {
       });
     }
 
-    // Save scanned inventory paths.
     if (action === "sync_chunk") {
       if (!session.scanning) {
         return reply(409, {
           ok: false,
           error: "No inventory scan is in progress.",
+          scanning: false,
+          scanStartedAt: session.scanStartedAt || null,
+          scanFinishedAt: session.scanFinishedAt || null,
         });
       }
 
       const paths = cleanPaths(data.paths);
-      const known = new Set(session.inventoryPaths);
+      const known = new Set(session.inventoryPaths || []);
 
       for (const path of paths) {
         if (!known.has(path)) {
@@ -244,7 +249,6 @@ export default async function handler(request) {
       });
     }
 
-    // Finish scanning.
     if (action === "scan_finish") {
       session.scanning = false;
       session.scanFinishedAt = new Date().toISOString();
@@ -257,9 +261,13 @@ export default async function handler(request) {
       });
     }
 
-    // Update worn inventory state.
     if (action === "worn_state") {
-      const items = Array.isArray(data.items) ? data.items : [];
+      // The LSL HUD sends "wornOutfits".
+      const items = Array.isArray(data.wornOutfits)
+        ? data.wornOutfits
+        : Array.isArray(data.items)
+          ? data.items
+          : [];
 
       session.wornState = items
         .filter((item) => typeof item === "string")
@@ -275,9 +283,17 @@ export default async function handler(request) {
       });
     }
 
-    // Queue a command for the HUD.
     if (action === "enqueue_command") {
-      const type = clean(data.command || data.type, 80);
+      // The website sends command as an object.
+      const input =
+        data.command && typeof data.command === "object"
+          ? data.command
+          : {};
+
+      const type = clean(
+        input.action || input.command || data.type,
+        80
+      );
 
       if (!["wear", "remove", "strip_all"].includes(type)) {
         return reply(400, {
@@ -286,12 +302,10 @@ export default async function handler(request) {
         });
       }
 
-      const path = clean(data.path, 1000);
+      const path = clean(input.path || data.path, 1000);
+      const outfitName = clean(input.outfitName, 200);
 
-      if (
-        (type === "wear" || type === "remove") &&
-        !path
-      ) {
+      if ((type === "wear" || type === "remove") && !path) {
         return reply(400, {
           ok: false,
           error: "A path is required for this command.",
@@ -300,13 +314,13 @@ export default async function handler(request) {
 
       const command = {
         id: crypto.randomUUID(),
-        command: type,
+        action: type,
         path,
+        outfitName,
         createdAt: new Date().toISOString(),
       };
 
       session.commands.push(command);
-
       await saveSession(store, token, session);
 
       return reply(200, {
@@ -315,7 +329,6 @@ export default async function handler(request) {
       });
     }
 
-    // Save command results from the HUD.
     if (action === "command_result") {
       const result = {
         id: clean(data.id || data.commandId, 100),
@@ -324,9 +337,10 @@ export default async function handler(request) {
         completedAt: new Date().toISOString(),
       };
 
-      session.commandResults.push(result);
-      session.commandResults =
-        session.commandResults.slice(-100);
+      session.commandResults = [
+        ...(session.commandResults || []),
+        result,
+      ].slice(-100);
 
       await saveSession(store, token, session);
 

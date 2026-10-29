@@ -519,13 +519,22 @@ function ConfirmModal({ title, message, confirmLabel, onConfirm, onCancel }) {
 ---------------------------------------------------------------- */
 
 export default function App() {
-  const token = useMemo(
-    () =>
-      new URLSearchParams(window.location.search).get("token") ||
-      localStorage.getItem("closety-token") ||
-      "",
-    []
+ const token = useMemo(() => {
+  const params = new URLSearchParams(window.location.search);
+  return (
+    params.get("token") ||
+    localStorage.getItem("closety-token") ||
+    ""
   );
+}, []);
+
+  useEffect(() => {
+  const urlToken = new URLSearchParams(window.location.search).get("token");
+
+  if (urlToken) {
+    localStorage.setItem("closety-token", urlToken);
+  }
+}, []);
 
   const [connection, setConnection] = useState("checking");
   const [avatarName, setAvatarName] = useState("");
@@ -579,10 +588,12 @@ export default function App() {
     setError("");
 
     try {
-      const response = await fetch(
-        `${API_URL}?action=state&token=${encodeURIComponent(token)}`,
-        { method: "GET", cache: "no-store" }
-      );
+      
+const response = await fetch(
+  `${API_URL}?action=status&token=${encodeURIComponent(token)}`,
+  { method: "GET", cache: "no-store" }
+);
+
 
       const data = await response.json();
 
