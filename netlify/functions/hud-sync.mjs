@@ -12,11 +12,10 @@ const corsHeaders = {
 };
 
 function response(statusCode, data) {
-  return {
-    statusCode,
+  return new Response(JSON.stringify(data), {
+    status: statusCode,
     headers: corsHeaders,
-    body: JSON.stringify(data),
-  };
+  });
 }
 
 function getToken(data = {}) {
@@ -80,12 +79,11 @@ function newSession(token, avatarUUID = "", avatarName = "") {
 
 export default async function handler(event) {
   if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 204,
-      headers: corsHeaders,
-      body: "",
-    };
-  }
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders,
+  });
+}
 
   const store = getStore(STORE_NAME);
 
