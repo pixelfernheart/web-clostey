@@ -682,13 +682,22 @@ h1, h2, h3, p { margin: 0; }
 .outfit-scroll-area::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
 .outfit-scroll-area::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 
-/* ---------- Outfit cards ---------- */
+/* ---------- Outfit cards (all identical shape and size) ---------- */
 
-.outfit-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
+.outfit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, 180px);
+  justify-content: start;
+  gap: 12px;
+}
+
+.outfit-grid > div { display: flex; }
 
 .outfit-card {
   display: flex;
   flex-direction: column;
+  width: 100%;
+  height: 100%;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 16px;
@@ -703,8 +712,9 @@ h1, h2, h3, p { margin: 0; }
   box-shadow: 0 0 0 1px rgba(100, 200, 140, 0.25), var(--shadow);
 }
 
-.outfit-image { position: relative; aspect-ratio: 4 / 5; background: var(--surface-2); }
-.outfit-image img { display: block; width: 100%; height: 100%; object-fit: cover; }
+/* Fixed 4:5 frame: every image fills it (cropped to cover), never stretches. */
+.outfit-image { position: relative; aspect-ratio: 4 / 5; overflow: hidden; background: var(--surface-2); }
+.outfit-image img { display: block; width: 100%; height: 100%; object-fit: fill; }
 
 .worn-badge {
   position: absolute;
@@ -751,26 +761,35 @@ h1, h2, h3, p { margin: 0; }
 
 .img-button input { display: none; }
 
-.outfit-info { display: flex; flex-direction: column; gap: 2px; padding: 12px; }
-.category-label { color: var(--accent); font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+.outfit-info { display: flex; flex-direction: column; gap: 2px; height: 118px; padding: 12px; overflow: hidden; }
+.category-label { overflow: hidden; color: var(--accent); font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
 .outfit-info h3 { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
 .path-label { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.image-label { color: var(--muted); font-size: 10px; }
-.image-label span { font-weight: 700; }
-.outfit-buttons { display: flex; gap: 6px; margin-top: 8px; }
+.outfit-buttons { display: flex; gap: 6px; margin-top: auto; }
 
 .wear-button, .remove-button { padding: 6px 10px; font-size: 11px; }
 
+/* Small round "×" on the image corner (keeps card height identical) */
 .remove-image-link {
-  align-self: flex-start;
-  margin-top: 4px;
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
   padding: 0;
   border: 0;
-  background: transparent;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow);
   color: var(--muted);
-  font-size: 10px;
-  text-decoration: underline;
+  font-size: 15px;
+  line-height: 1;
 }
+
+.remove-image-link:hover { color: var(--danger); }
 
 /* ---------- Worn card "jump to closet" ---------- */
 

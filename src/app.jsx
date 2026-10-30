@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import "./style.css";
 
 const API_URL = "/api/hud-sync";
@@ -141,18 +142,6 @@ function parentPathOf(path) {
   return parts.join("/");
 }
 
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = String(reader.result || "");
-      resolve(dataUrl.split(",")[1] || "");
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
-
 function base64ToBlob(value, mimeType) {
   const binary = atob(value || "");
   const bytes = new Uint8Array(binary.length);
@@ -160,8 +149,51 @@ function base64ToBlob(value, mimeType) {
   return new Blob([bytes], { type: mimeType || "image/png" });
 }
 
-function downloadJSON(data, filename) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+/* ---- Image compression: fit inside 600x750, JPEG, aim for <= 150 KB ---- */
+const IMG_MAX_W = 480;
+const IMG_MAX_H = 600;
+const IMG_TARGET_BYTES = 150 * 1024;
+
+async function canvasToBlob(canvas, quality) {
+  // Prefer WebP (smaller). Some browsers can't encode it and return PNG instead, so fall back to JPEG.
+  const webp = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", quality));
+  if (webp && webp.type === "image/webp") return webp;
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+}
+
+async function compressImage(file) {
+  const bitmap = await createImageBitmap(file);
+  const { width, height } = bitmap;
+
+  // Only ever scales down, never up.
+  let scale = Math.min(1, IMG_MAX_W / width, IMG_MAX_H / height);
+  let blob = null;
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff"; // PNG/WebP transparency -> white
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    let quality = 0.8;
+    blob = await canvasToBlob(canvas, quality);
+    while (blob && blob.size > IMG_TARGET_BYTES && quality > 0.6) {
+      quality = Math.round((quality - 0.05) * 100) / 100;
+      blob = await canvasToBlob(canvas, quality);
+    }
+    if (blob && blob.size <= IMG_TARGET_BYTES) break;
+    scale *= 0.85; // still too big: shrink dimensions and retry
+  }
+
+  if (typeof bitmap.close === "function") bitmap.close();
+  if (!blob) throw new Error("Could not compress that image.");
+  return blob;
+}
+
+function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -265,8 +297,19 @@ function OutfitCard({ outfit, image, busyCommand, isWorn, onPickFile, onRemoveIm
   return (
     <article className={`outfit-card ${isWorn ? "is-worn" : ""}`}>
       <div className="outfit-image">
-        <ImagePreview image={image} alt={image?.imageName || outfit.name} />
+        <ImagePreview image={image} alt={outfit.name} />
         {isWorn && <span className="worn-badge">WORN</span>}
+        {image && (
+          <button
+            className="remove-image-link"
+            type="button"
+            title="Remove preview image"
+            aria-label="Remove preview image"
+            onClick={() => onRemoveImage(outfit)}
+          >
+            ×
+          </button>
+        )}
         <label className="img-button">
           <span>＋</span> Add image
           <input
@@ -285,12 +328,6 @@ function OutfitCard({ outfit, image, busyCommand, isWorn, onPickFile, onRemoveIm
         <h3 title={outfit.name}>{outfit.name}</h3>
         <p className="path-label" title={outfit.path}>{outfit.path}</p>
 
-        {image && (
-          <p className="image-label">
-            <span>Image:</span> {image.imageName || outfit.name}
-          </p>
-        )}
-
         <div className="outfit-buttons">
           <button
             className={`button ${isWorn ? "remove-button" : "wear-button"}`}
@@ -301,16 +338,6 @@ function OutfitCard({ outfit, image, busyCommand, isWorn, onPickFile, onRemoveIm
             {label}
           </button>
         </div>
-
-        {image && (
-          <button
-            className="remove-image-link"
-            type="button"
-            onClick={() => onRemoveImage(outfit)}
-          >
-            Remove preview image
-          </button>
-        )}
       </div>
     </article>
   );
@@ -332,7 +359,7 @@ function WornCard({ item, image, busyCommand, onJumpToCloset, onCommand }) {
       </button>
 
       <div className="outfit-image">
-        <ImagePreview image={image} alt={image?.imageName || item.name} />
+        <ImagePreview image={image} alt={item.name} />
         <span className="worn-badge">WORN</span>
       </div>
 
@@ -662,17 +689,20 @@ export default function App() {
     const { outfit, file } = pendingUpload;
     setPendingUpload(null);
     try {
+      const compressed = await compressImage(file);
       await putImage({
         id: outfit.id,
         outfitPath: outfit.path,
         outfitName: outfit.name,
         imageName,
-        mimeType: file.type,
-        blob: file,
+        mimeType: compressed.type,
+        blob: compressed,
         updatedAt: Date.now(),
       });
       await reloadImages();
-      setNotice(`Saved the preview image for ${outfit.name}.`);
+      setNotice(
+        `Saved the preview image for ${outfit.name} (${Math.round(compressed.size / 1024)} KB).`
+      );
     } catch (err) {
       console.error(err);
       setNotice("Could not save the image to local browser storage.");
@@ -701,28 +731,46 @@ export default function App() {
   async function exportImageLibrary() {
     try {
       const records = await getAllImages();
-      const exported = [];
-      for (const record of records) {
-        exported.push({
+      const files = {};
+      const manifestImages = [];
+
+      for (let i = 0; i < records.length; i += 1) {
+        const record = records[i];
+        if (!record.blob) continue;
+        const ext = record.blob.type === "image/webp" ? "webp" : "jpg";
+        const fileName = `images/${String(i + 1).padStart(4, "0")}.${ext}`;
+        // JPEGs are already compressed, so store them without re-deflating.
+        files[fileName] = [new Uint8Array(await record.blob.arrayBuffer()), { level: 0 }];
+        manifestImages.push({
           id: record.id,
           outfitPath: record.outfitPath || record.id,
           outfitName: record.outfitName || "",
           imageName: record.imageName || "",
-          mimeType: record.mimeType || record.blob?.type || "image/png",
+          mimeType: record.blob.type || record.mimeType || "image/jpeg",
           updatedAt: record.updatedAt || Date.now(),
-          base64: record.blob ? await fileToBase64(record.blob) : "",
+          file: fileName,
         });
       }
-      downloadJSON(
-        {
-          format: "closety-image-library",
-          version: 1,
-          exportedAt: new Date().toISOString(),
-          images: exported,
-        },
-        "closety-images.json"
-      );
-      setNotice(`Exported ${exported.length} image(s).`);
+
+      files["manifest.json"] = [
+        strToU8(
+          JSON.stringify(
+            {
+              format: "closety-image-library",
+              version: 2,
+              exportedAt: new Date().toISOString(),
+              images: manifestImages,
+            },
+            null,
+            2
+          )
+        ),
+        { level: 6 },
+      ];
+
+      const zipped = zipSync(files);
+      downloadBlob(new Blob([zipped], { type: "application/zip" }), "closety-images.zip");
+      setNotice(`Exported ${manifestImages.length} image(s) as ZIP.`);
     } catch (err) {
       console.error(err);
       setNotice("Image library export failed.");
@@ -732,27 +780,58 @@ export default function App() {
   async function importImageLibrary(file) {
     if (!file) return;
     try {
-      const data = JSON.parse(await file.text());
-      if (data.format !== "closety-image-library" || !Array.isArray(data.images)) {
-        throw new Error("That file is not a Closety image-library backup.");
+      let count = 0;
+
+      if (/\.json$/i.test(file.name)) {
+        // Old JSON backups (base64). Still accepted, and compressed on the way in.
+        const data = JSON.parse(await file.text());
+        if (data.format !== "closety-image-library" || !Array.isArray(data.images)) {
+          throw new Error("That file is not a Closety image-library backup.");
+        }
+        for (const record of data.images) {
+          if (!record || typeof record.id !== "string") continue;
+          const compressed = await compressImage(base64ToBlob(record.base64, record.mimeType));
+          await putImage({
+            id: record.id,
+            outfitPath: record.outfitPath || record.id,
+            outfitName: record.outfitName || "",
+            imageName: record.imageName || record.outfitName || "",
+            mimeType: compressed.type,
+            updatedAt: record.updatedAt || Date.now(),
+            blob: compressed,
+          });
+          count += 1;
+        }
+      } else {
+        const entries = unzipSync(new Uint8Array(await file.arrayBuffer()));
+        if (!entries["manifest.json"]) {
+          throw new Error("That ZIP is not a Closety image-library backup.");
+        }
+        const manifest = JSON.parse(strFromU8(entries["manifest.json"]));
+        if (manifest.format !== "closety-image-library" || !Array.isArray(manifest.images)) {
+          throw new Error("That ZIP is not a Closety image-library backup.");
+        }
+        for (const record of manifest.images) {
+          const bytes = entries[record?.file];
+          if (!record || typeof record.id !== "string" || !bytes) continue;
+          await putImage({
+            id: record.id,
+            outfitPath: record.outfitPath || record.id,
+            outfitName: record.outfitName || "",
+            imageName: record.imageName || record.outfitName || "",
+            mimeType: record.mimeType || "image/jpeg",
+            updatedAt: record.updatedAt || Date.now(),
+            blob: new Blob([bytes], { type: record.mimeType || "image/jpeg" }),
+          });
+          count += 1;
+        }
       }
-      for (const record of data.images) {
-        if (!record || typeof record.id !== "string") continue;
-        await putImage({
-          id: record.id,
-          outfitPath: record.outfitPath || record.id,
-          outfitName: record.outfitName || "",
-          imageName: record.imageName || record.outfitName || "",
-          mimeType: record.mimeType || "image/png",
-          updatedAt: record.updatedAt || Date.now(),
-          blob: base64ToBlob(record.base64, record.mimeType),
-        });
-      }
+
       await reloadImages();
-      setNotice(`Imported ${data.images.length} image record(s).`);
+      setNotice(`Imported ${count} image(s).`);
     } catch (err) {
       console.error(err);
-      setNotice(`Import failed: ${err.message || "Invalid JSON file."}`);
+      setNotice(`Import failed: ${err.message || "Invalid backup file."}`);
     }
   }
 
@@ -1099,14 +1178,14 @@ export default function App() {
 
                 <div className="backup-actions">
                   <button className="button secondary" type="button" onClick={exportImageLibrary}>
-                    <span>↓</span> Export JSON
+                    <span>↓</span> Export ZIP
                   </button>
 
                   <label className="button secondary file-button">
-                    <span>↑</span> Import JSON
+                    <span>↑</span> Import ZIP
                     <input
                       type="file"
-                      accept=".json,application/json"
+                      accept=".zip,application/zip,.json,application/json"
                       onChange={(event) => {
                         importImageLibrary(event.target.files?.[0]);
                         event.target.value = "";
