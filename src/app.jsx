@@ -7,8 +7,67 @@ const DB_NAME = "closety-local";
 const DB_VERSION = 1;
 const STORE_NAME = "images";
 
+const DEFAULT_STORAGE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
+const STORAGE_LIMIT_KEY = "closety-storage-limit";
+const MIN_STORAGE_LIMIT_BYTES = 50 * 1024 * 1024;
+const MAX_STORAGE_LIMIT_BYTES = 50 * 1024 * 1024 * 1024;
+
+// Flat +50 KB cushion added on top of measured usage.
+// Empty → shows 50 KB. 100 KB stored → shows 150 KB. Etc.
+// Also makes the last 50 KB of the configured limit unreachable.
+const STORAGE_USAGE_CUSHION_BYTES = 50 * 1024;
+
 /* ---------------------------------------------------------------
-   IndexedDB image storage (unchanged)
+   Storage limit helpers
+---------------------------------------------------------------- */
+
+function loadStorageLimit() {
+  const raw = Number(localStorage.getItem(STORAGE_LIMIT_KEY));
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_STORAGE_LIMIT_BYTES;
+  return Math.min(Math.max(raw, MIN_STORAGE_LIMIT_BYTES), MAX_STORAGE_LIMIT_BYTES);
+}
+
+function saveStorageLimit(bytes) {
+  localStorage.setItem(STORAGE_LIMIT_KEY, String(bytes));
+}
+
+function formatBytes(bytes) {
+  if (!bytes || bytes < 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+/* ---------------------------------------------------------------
+   Origin usage measurement
+   Primary: navigator.storage.estimate().usage  (matches DevTools)
+   Fallback: sum of blob sizes if the API is unavailable.
+---------------------------------------------------------------- */
+
+function sumBlobBytes(records) {
+  return (records || []).reduce((sum, r) => sum + (r?.blob?.size || 0), 0);
+}
+
+async function measureOriginUsage(fallbackRecords) {
+  if (navigator.storage?.estimate) {
+    try {
+      const { usage } = await navigator.storage.estimate();
+      if (typeof usage === "number" && usage >= 0) return usage;
+    } catch {
+      /* fall through to blob sum */
+    }
+  }
+  const records = fallbackRecords ?? (await getAllImages());
+  return sumBlobBytes(records);
+}
+
+/* ---------------------------------------------------------------
+   IndexedDB image storage
 ---------------------------------------------------------------- */
 
 function openDatabase() {
@@ -63,8 +122,19 @@ async function deleteImage(id) {
   });
 }
 
+async function clearAllImages() {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).clear();
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+    tx.onabort = () => { db.close(); reject(tx.error || new Error("Clear cancelled.")); };
+  });
+}
+
 /* ---------------------------------------------------------------
-   Helpers
+   Path / tree helpers
 ---------------------------------------------------------------- */
 
 function normalizePath(path) {
@@ -149,13 +219,12 @@ function base64ToBlob(value, mimeType) {
   return new Blob([bytes], { type: mimeType || "image/png" });
 }
 
-/* ---- Image compression: fit inside 600x750, JPEG, aim for <= 150 KB ---- */
+/* ---- Image compression: fit inside 480x600, JPEG/WebP, aim for <= 150 KB ---- */
 const IMG_MAX_W = 480;
 const IMG_MAX_H = 600;
 const IMG_TARGET_BYTES = 150 * 1024;
 
 async function canvasToBlob(canvas, quality) {
-  // Prefer WebP (smaller). Some browsers can't encode it and return PNG instead, so fall back to JPEG.
   const webp = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", quality));
   if (webp && webp.type === "image/webp") return webp;
   return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
@@ -165,7 +234,6 @@ async function compressImage(file) {
   const bitmap = await createImageBitmap(file);
   const { width, height } = bitmap;
 
-  // Only ever scales down, never up.
   let scale = Math.min(1, IMG_MAX_W / width, IMG_MAX_H / height);
   let blob = null;
 
@@ -174,7 +242,7 @@ async function compressImage(file) {
     canvas.width = Math.max(1, Math.round(width * scale));
     canvas.height = Math.max(1, Math.round(height * scale));
     const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#ffffff"; // PNG/WebP transparency -> white
+    ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
 
@@ -185,7 +253,7 @@ async function compressImage(file) {
       blob = await canvasToBlob(canvas, quality);
     }
     if (blob && blob.size <= IMG_TARGET_BYTES) break;
-    scale *= 0.85; // still too big: shrink dimensions and retry
+    scale *= 0.85;
   }
 
   if (typeof bitmap.close === "function") bitmap.close();
@@ -279,11 +347,6 @@ function ImagePreview({ image, alt }) {
   return <img src={url} alt={alt} />;
 }
 
-/* Button is disabled ONLY while the POST is in flight (busyCommand).
-   It NEVER reads server state to decide its label — it uses `isWorn`
-   which reflects the local, optimistic worn list. Click Wear →
-   `isWorn` flips immediately in the parent, so this component
-   re-renders as Remove on the same tick. No "REMOVING…" flash. */
 function OutfitCard({ outfit, image, busyCommand, isWorn, onPickFile, onRemoveImage, onCommand }) {
   const key = outfit.id;
   const busyWear = busyCommand === `wear:${key}`;
@@ -299,7 +362,8 @@ function OutfitCard({ outfit, image, busyCommand, isWorn, onPickFile, onRemoveIm
       <div className="outfit-image">
         <ImagePreview image={image} alt={outfit.name} />
         {isWorn && <span className="worn-badge">WORN</span>}
-        {image && (
+
+        {image ? (
           <button
             className="remove-image-link"
             type="button"
@@ -309,18 +373,19 @@ function OutfitCard({ outfit, image, busyCommand, isWorn, onPickFile, onRemoveIm
           >
             ×
           </button>
+        ) : (
+          <label className="img-button">
+            <span>＋</span> Add image
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={(event) => {
+                onPickFile(outfit, event.target.files?.[0]);
+                event.target.value = "";
+              }}
+            />
+          </label>
         )}
-        <label className="img-button">
-          <span>＋</span> Add image
-          <input
-            type="file"
-            accept="image/jpeg,image/png,image/webp"
-            onChange={(event) => {
-              onPickFile(outfit, event.target.files?.[0]);
-              event.target.value = "";
-            }}
-          />
-        </label>
       </div>
 
       <div className="outfit-info">
@@ -508,6 +573,90 @@ function ConfirmModal({ title, message, confirmLabel, onConfirm, onCancel }) {
   );
 }
 
+function StorageMeter({ used, limit, onChangeLimit }) {
+  const [editing, setEditing] = useState(false);
+  const [draftGb, setDraftGb] = useState("");
+
+  const pct = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+  const nearFull = pct >= 90;
+  const full = used >= limit;
+
+  function commit() {
+    const gb = Number(draftGb);
+    if (!Number.isFinite(gb) || gb <= 0) {
+      setEditing(false);
+      return;
+    }
+    const bytes = Math.round(gb * 1024 * 1024 * 1024);
+    const clamped = Math.min(Math.max(bytes, MIN_STORAGE_LIMIT_BYTES), MAX_STORAGE_LIMIT_BYTES);
+    onChangeLimit(clamped);
+    setEditing(false);
+  }
+
+  return (
+    <div className={`storage-meter ${full ? "is-full" : nearFull ? "is-near" : ""}`}>
+      <div className="storage-meter-head">
+        <small>BROWSER STORAGE</small>
+        <span className="storage-figures" title="Includes a fixed 50 KB cushion">
+          {formatBytes(used)} / {formatBytes(limit)}
+        </span>
+      </div>
+
+      <div
+        className="storage-bar"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(pct)}
+      >
+        <div className="storage-bar-fill" style={{ width: `${pct}%` }} />
+      </div>
+
+      <div className="storage-meter-foot">
+        <span>{pct.toFixed(1)}% used</span>
+        {editing ? (
+          <span className="storage-limit-edit">
+            <input
+              type="number"
+              min={0.05}
+              max={50}
+              step={0.5}
+              value={draftGb}
+              onChange={(e) => setDraftGb(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commit();
+                if (e.key === "Escape") setEditing(false);
+              }}
+              aria-label="Storage limit in gigabytes"
+              autoFocus
+            />
+            <span>GB</span>
+            <button type="button" className="mini-button" onClick={commit}>✓</button>
+            <button type="button" className="mini-button" onClick={() => setEditing(false)}>×</button>
+          </span>
+        ) : (
+          <button
+            type="button"
+            className="storage-limit-button"
+            onClick={() => {
+              setDraftGb(String(Math.round((limit / (1024 ** 3)) * 10) / 10));
+              setEditing(true);
+            }}
+          >
+            Limit: {formatBytes(limit)} · edit
+          </button>
+        )}
+      </div>
+
+      {full && (
+        <p className="storage-warning">
+          Storage full — new images are blocked until you remove some or raise the limit.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* ---------------------------------------------------------------
    App
 ---------------------------------------------------------------- */
@@ -540,6 +689,10 @@ export default function App() {
   const [wornOutfits, setWornOutfits] = useState([]);
   const [theme, setTheme] = useState(() => localStorage.getItem("closety-theme") || "light");
   const [activeTab, setActiveTab] = useState("closet");
+  const [storageLimit, setStorageLimit] = useState(() => loadStorageLimit());
+  // `storageUsed` = origin usage + 50 KB cushion. The cushion is baked in
+  // once here, so every consumer (bar, guards, imports) reads the same value.
+  const [storageUsed, setStorageUsed] = useState(STORAGE_USAGE_CUSHION_BYTES);
 
   const tree = useMemo(() => buildTree(folders), [folders]);
   const allOutfits = useMemo(() => collectOutfits(tree), [tree]);
@@ -549,19 +702,45 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    saveStorageLimit(storageLimit);
+  }, [storageLimit]);
+
+  useEffect(() => {
     if (!notice) return undefined;
     const timer = window.setTimeout(() => setNotice(""), 5000);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
+  /* Re-measure browser origin usage and add the +50 KB cushion.
+     `records` is optional — used as a fallback for browsers that
+     lack navigator.storage.estimate(). */
+  const recalcStorageUsed = useCallback(async (records) => {
+    try {
+      const raw = await measureOriginUsage(records);
+      const withCushion = raw + STORAGE_USAGE_CUSHION_BYTES;
+      setStorageUsed(withCushion);
+      return withCushion;
+    } catch (err) {
+      console.error(err);
+      return null;
+    }
+  }, []);
+
   const reloadImages = useCallback(async () => {
     try {
-      setImages(await getAllImages());
+      const records = await getAllImages();
+      setImages(records);
+      await recalcStorageUsed(records);
+      // IndexedDB can lag behind deletes. Ask again shortly so the
+      // bar can drop once the browser reclaims pages.
+      window.setTimeout(() => {
+        recalcStorageUsed(records).catch(() => { });
+      }, 800);
     } catch (err) {
       console.error(err);
       setNotice("Could not load the local image library.");
     }
-  }, []);
+  }, [recalcStorageUsed]);
 
   /* Single fetch triggered by: page load, Refresh button, or (optionally)
      tab focus. Never triggered by a Wear/Remove click. */
@@ -681,15 +860,43 @@ export default function App() {
       setNotice("Please choose a JPEG, PNG, or WebP image.");
       return;
     }
+    // `storageUsed` already includes the +50 KB cushion.
+    if (storageUsed >= storageLimit) {
+      setNotice(
+        `Browser storage limit reached (${formatBytes(storageLimit)}). Remove some images or raise the limit.`
+      );
+      return;
+    }
     setPendingUpload({ outfit, file });
   }
 
   async function saveImage(imageName) {
     if (!pendingUpload) return;
     const { outfit, file } = pendingUpload;
+
+    if (storageUsed >= storageLimit) {
+      setPendingUpload(null);
+      setNotice(
+        `Browser storage limit reached (${formatBytes(storageLimit)}). Remove some images or raise the limit.`
+      );
+      return;
+    }
+
     setPendingUpload(null);
     try {
       const compressed = await compressImage(file);
+      // Re-measure just before saving. `storageUsed` already includes
+      // the +50 KB cushion, so compare the new blob against the plain limit.
+      const freshRaw = await measureOriginUsage(images);
+      const freshWithCushion = freshRaw + STORAGE_USAGE_CUSHION_BYTES;
+      if (freshWithCushion + compressed.size > storageLimit) {
+        setNotice(
+          `Not enough room: this image is ${formatBytes(compressed.size)} but only ${formatBytes(
+            Math.max(0, storageLimit - freshWithCushion)
+          )} is free. Remove some images or raise the limit.`
+        );
+        return;
+      }
       await putImage({
         id: outfit.id,
         outfitPath: outfit.path,
@@ -728,6 +935,26 @@ export default function App() {
     });
   }
 
+  function clearImageLibrary() {
+    setConfirmState({
+      title: "Clear all preview images?",
+      message:
+        "Every preview image stored in this browser will be removed. Your wardrobe folders are not affected.",
+      confirmLabel: "Clear all",
+      onConfirm: async () => {
+        setConfirmState(null);
+        try {
+          await clearAllImages();
+          await reloadImages();
+          setNotice("All preview images cleared.");
+        } catch (err) {
+          console.error(err);
+          setNotice("Could not clear the image library.");
+        }
+      },
+    });
+  }
+
   async function exportImageLibrary() {
     try {
       const records = await getAllImages();
@@ -739,7 +966,6 @@ export default function App() {
         if (!record.blob) continue;
         const ext = record.blob.type === "image/webp" ? "webp" : "jpg";
         const fileName = `images/${String(i + 1).padStart(4, "0")}.${ext}`;
-        // JPEGs are already compressed, so store them without re-deflating.
         files[fileName] = [new Uint8Array(await record.blob.arrayBuffer()), { level: 0 }];
         manifestImages.push({
           id: record.id,
@@ -781,9 +1007,33 @@ export default function App() {
     if (!file) return;
     try {
       let count = 0;
+      let skipped = 0;
+
+      const acceptRecord = async (record, blob, fallbackMime) => {
+        if (!record || typeof record.id !== "string") return false;
+        // Measure origin usage right before every insert and add the
+        // +50 KB cushion so the import check uses the same rule as
+        // manual uploads.
+        const freshRaw = await measureOriginUsage();
+        const freshWithCushion = freshRaw + STORAGE_USAGE_CUSHION_BYTES;
+        if (freshWithCushion + (blob?.size || 0) > storageLimit) {
+          skipped += 1;
+          return false;
+        }
+        await putImage({
+          id: record.id,
+          outfitPath: record.outfitPath || record.id,
+          outfitName: record.outfitName || "",
+          imageName: record.imageName || record.outfitName || "",
+          mimeType: blob.type || fallbackMime || "image/jpeg",
+          updatedAt: record.updatedAt || Date.now(),
+          blob,
+        });
+        count += 1;
+        return true;
+      };
 
       if (/\.json$/i.test(file.name)) {
-        // Old JSON backups (base64). Still accepted, and compressed on the way in.
         const data = JSON.parse(await file.text());
         if (data.format !== "closety-image-library" || !Array.isArray(data.images)) {
           throw new Error("That file is not a Closety image-library backup.");
@@ -791,16 +1041,7 @@ export default function App() {
         for (const record of data.images) {
           if (!record || typeof record.id !== "string") continue;
           const compressed = await compressImage(base64ToBlob(record.base64, record.mimeType));
-          await putImage({
-            id: record.id,
-            outfitPath: record.outfitPath || record.id,
-            outfitName: record.outfitName || "",
-            imageName: record.imageName || record.outfitName || "",
-            mimeType: compressed.type,
-            updatedAt: record.updatedAt || Date.now(),
-            blob: compressed,
-          });
-          count += 1;
+          await acceptRecord(record, compressed, record.mimeType);
         }
       } else {
         const entries = unzipSync(new Uint8Array(await file.arrayBuffer()));
@@ -814,36 +1055,27 @@ export default function App() {
         for (const record of manifest.images) {
           const bytes = entries[record?.file];
           if (!record || typeof record.id !== "string" || !bytes) continue;
-          await putImage({
-            id: record.id,
-            outfitPath: record.outfitPath || record.id,
-            outfitName: record.outfitName || "",
-            imageName: record.imageName || record.outfitName || "",
-            mimeType: record.mimeType || "image/jpeg",
-            updatedAt: record.updatedAt || Date.now(),
-            blob: new Blob([bytes], { type: record.mimeType || "image/jpeg" }),
-          });
-          count += 1;
+          const blob = new Blob([bytes], { type: record.mimeType || "image/jpeg" });
+          await acceptRecord(record, blob, record.mimeType);
         }
       }
 
       await reloadImages();
-      setNotice(`Imported ${count} image(s).`);
+      setNotice(
+        `Imported ${count} image(s).${skipped ? ` Skipped ${skipped} — storage limit reached.` : ""}`
+      );
     } catch (err) {
       console.error(err);
       setNotice(`Import failed: ${err.message || "Invalid backup file."}`);
     }
   }
 
-  /* The core of the fix.
-     Optimistically flips the local worn list on click, then sends the
-     command to the HUD. Rolls back on failure.
-     ZERO calls to ?action=status after the POST returns. */
+  /* Optimistically flips the local worn list on click, then sends the
+     command to the HUD. Rolls back on failure. */
   async function postCommand(action, outfit) {
     const key = outfit?.id || outfit?.path;
     const wasAlreadyWorn = outfit?.path ? isWorn(outfit.path) : false;
 
-    // ---- Optimistic local update (no server round-trip) ----
     if (action === "wear" && outfit?.path) {
       setWornOutfits((prev) =>
         prev.some((p) => samePath(p, outfit.path))
@@ -883,13 +1115,9 @@ export default function App() {
       setNotice(
         `${action.replaceAll("_", " ").toUpperCase()} queued. Keep the Closety HUD attached in Second Life.`
       );
-
-      // No follow-up fetch. The next status poll happens only when
-      // the user clicks Refresh.
     } catch (err) {
       console.error(err);
       setNotice(`Command not sent: ${err.message}.`);
-      // Roll back the optimistic update.
       if (action === "wear" && outfit?.path && !wasAlreadyWorn) {
         setWornOutfits((prev) => prev.filter((p) => !samePath(p, outfit.path)));
       } else if (action === "remove" && outfit?.path && wasAlreadyWorn) {
@@ -897,8 +1125,6 @@ export default function App() {
           prev.some((p) => samePath(p, outfit.path)) ? prev : [...prev, outfit.path]
         );
       }
-      // strip_all rollback not attempted (requires a fetch to know
-      // what was previously worn). User can click Refresh if needed.
     } finally {
       setBusyCommand("");
     }
@@ -1014,6 +1240,14 @@ export default function App() {
             )}
           </div>
         )}
+
+        <div className="sidebar-storage">
+          <StorageMeter
+            used={storageUsed}
+            limit={storageLimit}
+            onChangeLimit={setStorageLimit}
+          />
+        </div>
 
         <div className="sidebar-bottom">
           <div className="avatar-badge">SL</div>
@@ -1177,6 +1411,7 @@ export default function App() {
                 </div>
 
                 <div className="backup-actions">
+                  <p style={{ margin: 0, padding: 0, alignContent: "center" }}>Export or Import Images</p>
                   <button className="button secondary" type="button" onClick={exportImageLibrary}>
                     <span>↓</span> Export ZIP
                   </button>
@@ -1316,7 +1551,16 @@ export default function App() {
 
               <p className="inventory-note">
                 The number next to a folder is the number of subfolders and items directly inside it.
+                Use <strong>Clear all images</strong> to free up browser storage.
               </p>
+
+              {images.length > 0 && (
+                <div className="clear-library-row">
+                  <button className="button secondary" type="button" onClick={clearImageLibrary}>
+                    <span>🗑</span> Clear all images ({images.length})
+                  </button>
+                </div>
+              )}
             </section>
           )}
 
