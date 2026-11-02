@@ -643,7 +643,19 @@ h1, h2, h3, p { margin: 0; }
 .browse-heading h3 { font-size: 18px; }
 .browse-heading > span { color: var(--muted); font-size: 12px; }
 
-.folder-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+.folder-card-grid  {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 12px;
+  max-height:412px;
+  overflow-x: auto; 
+  white-space: nowrap; 
+  &::-webkit-scrollbar {
+    display: none;
+  }
+  scrollbar-width: none;  /* Firefox */
+  -ms-overflow-style: none;  /* IE and Edge */
+}
 
 .folder-card {
   display: flex;
